@@ -141,6 +141,8 @@ public class PdfSigner {
      */
     public static final int CERTIFIED_FORM_FILLING_AND_ANNOTATIONS = 3;
 
+    public static final PdfName GFAAnnot = new PdfName("GFA:Annot");
+
     /**
      * The certification level.
      */
@@ -708,6 +710,53 @@ public class PdfSigner {
     }
 
     /**
+     * Sign the document using an external container, usually a PKCS7. The signature is fully composed
+     * externally, iText will just put the container inside the document.
+     * <br><br>
+     * NOTE: This method closes the underlying pdf document. This means, that current instance
+     * of PdfSigner cannot be used after this method call.
+     *
+     * @param externalSignatureContainer the interface providing the actual signing
+     * @param estimatedSize              the reserved size for the signature
+     * @throws GeneralSecurityException if some problem during apply security algorithms occurs
+     * @throws IOException              if some I/O problem occurs
+     */
+    public void signAnnotExternalContainer(IExternalSignatureContainer externalSignatureContainer, int estimatedSize) throws GeneralSecurityException, IOException {
+        if (closed) {
+            throw new PdfException(PdfException.ThisInstanceOfPdfSignerAlreadyClosed);
+        }
+
+        PdfSignature dic = new PdfSignature();
+        PdfSignatureAppearance appearance = getSignatureAppearance();
+        dic.setReason(appearance.getReason());
+        dic.setLocation(appearance.getLocation());
+        dic.setSignatureCreator(appearance.getSignatureCreator());
+        dic.setContact(appearance.getContact());
+        dic.setDate(new PdfDate(getSignDate())); // time-stamp will over-rule this
+        externalSignatureContainer.modifySigningDictionary(dic.getPdfObject());
+        cryptoDictionary = dic;
+
+        Map<PdfName, Integer> exc = new HashMap<>();
+        exc.put(PdfName.Contents, estimatedSize * 2 + 2);
+        preCloseGfa(exc);
+
+        InputStream data = getRangeStream();
+        byte[] encodedSig = externalSignatureContainer.sign(data);
+
+        if (estimatedSize < encodedSig.length)
+            throw new IOException("Not enough space");
+
+        byte[] paddedSig = new byte[estimatedSize];
+        System.arraycopy(encodedSig, 0, paddedSig, 0, encodedSig.length);
+
+        PdfDictionary dic2 = new PdfDictionary();
+        dic2.put(PdfName.Contents, new PdfString(paddedSig).setHexWriting(true));
+        close(dic2);
+
+        closed = true;
+    }
+
+    /**
      * Signs a document with a PAdES-LTV Timestamp. The document is closed at the end.
      * <br><br>
      * NOTE: This method closes the underlying pdf document. This means, that current instance
@@ -975,6 +1024,117 @@ public class PdfSigner {
         }
     }
 
+
+    /**
+     * This is the first method to be called when using external signatures. The general sequence is:
+     * preClose(), getDocumentBytes() and close().
+     * <p>
+     * <CODE>exclusionSizes</CODE> must contain at least
+     * the <CODE>PdfName.CONTENTS</CODE> key with the size that it will take in the
+     * document. Note that due to the hex string coding this size should be byte_size*2+2.
+     *
+     * @param exclusionSizes Map with names and sizes to be excluded in the signature
+     *                       calculation. The key is a PdfName and the value an Integer. At least the /Contents must be present
+     * @throws IOException on error
+     */
+    protected void preCloseGfa(Map<PdfName, Integer> exclusionSizes) throws IOException {
+        if (preClosed) {
+            throw new PdfException(PdfException.DocumentAlreadyPreClosed);
+        }
+        preClosed = true;
+
+        String name = getFieldName();
+
+        if (cryptoDictionary == null) {
+            throw new PdfException(PdfException.NoCryptoDictionaryDefined);
+        }
+
+        cryptoDictionary.getPdfObject().makeIndirect(document);
+        createNewSignatureAnnotation(name);
+
+        exclusionLocations = new HashMap<>();
+
+        PdfLiteral lit = new PdfLiteral(80);
+        exclusionLocations.put(PdfName.ByteRange, lit);
+        cryptoDictionary.put(PdfName.ByteRange, lit);
+        for (Map.Entry<PdfName, Integer> entry : exclusionSizes.entrySet()) {
+            PdfName key = entry.getKey();
+            lit = new PdfLiteral((int) entry.getValue());
+            exclusionLocations.put(key, lit);
+            cryptoDictionary.put(key, lit);
+        }
+        if (certificationLevel > 0) {
+            addDocMDP(cryptoDictionary);
+        }
+        if (fieldLock != null) {
+            addFieldMDP(cryptoDictionary, fieldLock);
+        }
+        if (signatureEvent != null) {
+            signatureEvent.getSignatureDictionary(cryptoDictionary);
+        }
+
+        if (certificationLevel > 0) {
+            // add DocMDP entry to root
+            PdfDictionary docmdp = new PdfDictionary();
+            docmdp.put(PdfName.DocMDP, cryptoDictionary.getPdfObject());
+            document.getCatalog().put(PdfName.Perms, docmdp);
+            document.getCatalog().setModified();
+        }
+        cryptoDictionary.getPdfObject().flush(false);
+        document.close();
+
+        range = new long[exclusionLocations.size() * 2];
+        long byteRangePosition = exclusionLocations.get(PdfName.ByteRange).getPosition();
+        exclusionLocations.remove(PdfName.ByteRange);
+        int idx = 1;
+        for (PdfLiteral lit1 : exclusionLocations.values()) {
+            long n = lit1.getPosition();
+            range[idx++] = n;
+            range[idx++] = lit1.getBytesCount() + n;
+        }
+        Arrays.sort(range, 1, range.length - 1);
+        for (int k = 3; k < range.length - 2; k += 2)
+            range[k] -= range[k - 1];
+
+        if (tempFile == null) {
+            bout = temporaryOS.toByteArray();
+            range[range.length - 1] = bout.length - range[range.length - 2];
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            PdfOutputStream os = new PdfOutputStream(bos);
+            os.write('[');
+            for (int k = 0; k < range.length; ++k) {
+                os.writeLong(range[k]).write(' ');
+            }
+            os.write(']');
+            System.arraycopy(bos.toByteArray(), 0, bout, (int) byteRangePosition, (int) bos.size());
+        } else {
+            try {
+                raf = FileUtil.getRandomAccessFile(tempFile);
+                long len = raf.length();
+                range[range.length - 1] = len - range[range.length - 2];
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                PdfOutputStream os = new PdfOutputStream(bos);
+                os.write('[');
+                for (int k = 0; k < range.length; ++k) {
+                    os.writeLong(range[k]).write(' ');
+                }
+                os.write(']');
+                raf.seek(byteRangePosition);
+                raf.write(bos.toByteArray(), 0, (int) bos.size());
+            } catch (IOException e) {
+                try {
+                    raf.close();
+                } catch (Exception ignored) {
+                }
+                try {
+                    tempFile.delete();
+                } catch (Exception ignored) {
+                }
+                throw e;
+            }
+        }
+    }
+
     /**
      * Populates already existing signature form field in the acroForm object.
      * This method is called during the {@link PdfSigner#preClose(Map)} method if the signature field already exists.
@@ -1073,6 +1233,43 @@ public class PdfSigner {
         }
 
         return sigFieldLock;
+    }
+
+    /**
+     * Creates new signature annotation and adds it to the page annots object.
+     *
+     * @param name     the name of the annotation
+     * @throws IOException if font for the appearance dictionary cannot be created
+     */
+    protected void createNewSignatureAnnotation(String name) throws IOException {
+        PdfWidgetAnnotation widget = new PdfWidgetAnnotation(appearance.getPageRect());
+        widget.put(PdfName.Type, PdfName.Annot);
+        widget.put(PdfName.Subtype, GFAAnnot);
+        widget.put(PdfName.FT, PdfName.Sig);
+        widget.put(PdfName.T, new PdfString(name));
+        widget.put(PdfName.V, cryptoDictionary.getPdfObject());
+        widget.setFlags(PdfAnnotation.PRINT | PdfAnnotation.LOCKED);
+
+        int pagen = appearance.getPageNumber();
+        PdfPage pdfPage = document.getPage(pagen);
+        widget.setPage(pdfPage);
+
+        if (appearance.isInvisible()) {
+            // According to the spec, appearance stream is not required if the width and height of the rectangle are 0
+            widget.remove(PdfName.AP);
+        } else {
+            PdfDictionary ap = widget.getAppearanceDictionary();
+            if (ap == null) {
+                ap = new PdfDictionary();
+                widget.put(PdfName.AP, ap);
+            }
+            ap.put(PdfName.N, appearance.getAppearance().getPdfObject());
+        }
+
+        // acroForm.addField(sigField, document.getPage(pagen));
+        pdfPage.addAnnotation(widget);
+
+        document.getCatalog().setModified();
     }
 
     /**
