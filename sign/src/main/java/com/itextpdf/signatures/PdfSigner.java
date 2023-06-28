@@ -1248,7 +1248,7 @@ public class PdfSigner {
         widget.put(PdfName.FT, PdfName.Sig);
         widget.put(PdfName.T, new PdfString(name));
         widget.put(PdfName.V, cryptoDictionary.getPdfObject());
-        widget.setFlags(PdfAnnotation.PRINT | PdfAnnotation.LOCKED);
+        widget.setFlags(PdfAnnotation.PRINT | PdfAnnotation.LOCKED | PdfAnnotation.READ_ONLY);
 
         int pagen = appearance.getPageNumber();
         PdfPage pdfPage = document.getPage(pagen);
